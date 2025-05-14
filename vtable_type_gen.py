@@ -1,8 +1,9 @@
 # Create a VTable structure from the current selection.
 # @category Structure
-# @keybinding
+# @keybinding ctrl shift q
 # @menupath
 # @toolbar
+# @runtime PyGhidra
 
 from ghidra.app.script import GhidraScript
 from ghidra.program.model.data import (
