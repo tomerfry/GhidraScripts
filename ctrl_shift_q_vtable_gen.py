@@ -74,6 +74,8 @@ def run():
         if not method_obj:
             break
 
+        method_obj.setCallingConvention("__thiscall")
+        method_obj.setParentNamespace(vftable_sym.getParentNamespace())
         print(str(method_obj.getSignature(True)))
 
         if method_obj:
