@@ -21,7 +21,8 @@ def run():
 
     vftable_sym = getSymbolAt(currentAddress)
 
-    if vftable_sym.getName() != "vftable":
+    print(str(type(vftable_sym)))
+    if "NoneType" in str(type(vftable_sym)) or vftable_sym.getName() != "vftable":
         print("Errror not a valid vftable symbol selected")
         return
 
@@ -37,7 +38,7 @@ def run():
             category_path = CategoryPath.ROOT 
             println("Using root category instead.")
 
-    struct_name = str(vftable_sym.getParentNamespace()).split(' ')[0]
+    struct_name = str(vftable_sym.getParentNamespace()).split(' ')[0] + "_vftable"
     print(struct_name)
 
     existing_struct = dtm.getDataType(category_path, struct_name)
@@ -91,24 +92,6 @@ def run():
         println("Successfully created/updated VTable structure: {} in category {}".format(
             added_type.getName(), added_type.getCategoryPath()
         ))
-
-        if askYesNo("Apply Structure?", "Apply the new VTable structure '{}' at address {}?".format(added_type.getName(), vftable_sym.getAddress())):
-            try:
-                # It's good practice to clear existing data first, especially if it's undefined or conflicting
-                # Be careful with clearListing as it can remove other analysis.
-                # A safer approach for vtables is often to just createData.
-                # clearListing(sel_min_addr, sel_min_addr.add(vtable_struct.getLength() - 1))
-                
-                # Create the data using the new structure
-                created_data = createData(sel_min_addr, added_type)
-                if created_data is not None:
-                    println("Successfully applied structure {} at {}".format(added_type.getName(), sel_min_addr))
-                else:
-                    printerr("Failed to apply structure at {}. It might be part of an existing instruction or defined data.".format(sel_min_addr))
-            except Exception as e:
-                printerr("Error applying structure: {}".format(e))
-        else:
-            println("Structure not applied. You can find it in the Data Type Manager under {}.".format(category_path))
     else:
         printerr("Failed to add VTable structure to Data Type Manager.")
 
