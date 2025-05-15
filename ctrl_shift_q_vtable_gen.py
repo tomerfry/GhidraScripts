@@ -13,6 +13,10 @@ from ghidra.program.model.data import (
 from ghidra.program.model.symbol import SourceType
 from ghidra.program.model.listing import Variable
 from ghidra.util.exception import CancelledException
+from ghidra.app.decompiler.util import FillOutStructureCmd
+from ghidra.program.util import ProgramLocation
+from ghidra.app.decompiler import DecompileOptions
+from ghidra.app.decompiler.component import DecompilerUtils
 
 def run():
     dtm = currentProgram.getDataTypeManager()
@@ -77,6 +81,11 @@ def run():
         method_obj.setCallingConvention("__thiscall")
         method_obj.setParentNamespace(vftable_sym.getParentNamespace())
         print(str(method_obj.getSignature(True)))
+
+        progloc = ProgramLocation(currentProgram, method_obj.symbol.address)
+        decompopts = DecompilerUtils.getDecompileOptions(state.getTool(), currentProgram)
+        cmd = FillOutStructureCmd(progloc, decompopts)
+        cmd.applyTo(currentProgram, monitor)
 
         if method_obj:
             method_def = FunctionDefinitionDataType(method_obj.getSignature(True), dtm)
