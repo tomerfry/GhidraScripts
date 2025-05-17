@@ -16,8 +16,8 @@ int main(int argc, char **argv) {
 }
 
 void check_license_for_new_person(int redos){
-    person_t *jay = create_person(16, 11, "will");
-    person_t *john = create_person(17, 11, "will");
+    person_t *jay = create_person(16, 11, "jay");
+    person_t *john = create_person(17, 11, "john");
     free(john);
     person_t *will = create_person(15, 11, "will");
     
