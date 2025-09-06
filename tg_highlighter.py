@@ -1,7 +1,7 @@
 # Variable Assignment of TG_ vars with Force Re-decompile Toggle
 #@author Tomer Goldschmidt
 #@category _NEW_
-#@keybinding ctrl T
+#@keybinding ctrl shif T
 #@menupath Tools.Highlighters.Toggle TG_ Variables
 #@toolbar 
 #@runtime PyGhidra
