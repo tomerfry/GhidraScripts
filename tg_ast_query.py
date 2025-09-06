@@ -159,12 +159,10 @@ class ASTPatternEngine:
         if not node:
             return
             
-        continue_traversal = callback(node, depth, parent)
-        
-        if continue_traversal:
-            for i in range(node.numChildren()):
-                child = node.Child(i)
-                self.traverse_ast(child, callback, depth + 1, node)
+        for token in node.tokenIterator(True):
+            if not callback(token, depth, parent):
+                break
+            
     
     def find_pattern(self, pattern_type, **kwargs):
         """
@@ -184,7 +182,11 @@ class ASTPatternEngine:
         if ast:
             self.current_function = func
 
-            self.traverse_ast(ast, lambda a,b,c: print(a,b,c))
+            def present_node(node, depth, parent):
+                print("Node: {}".format(node))
+                return True
+
+            self.traverse_ast(ast, present_node)
             if pattern_type == 'assignment':
                 self._find_assignments_in_ast(ast, **kwargs)
             elif pattern_type == 'function_call':
