@@ -138,16 +138,12 @@ class ASTPatternEngine:
         if hasattr(self, 'decompiler'):
             self.decompiler.dispose()
     
-    def get_ast(self, function):
+    def get_ast(self, func_entry_point, function_c_markup):
         """Get or cache the AST for a function"""
-        func_addr = function.getEntryPoint()
+        func_addr = func_entry_point
         
         if func_addr not in self.ast_cache:
-            results = self.decompiler.decompileFunction(function, 30, monitor)
-            if results.decompileCompleted():
-                self.ast_cache[func_addr] = results.getCCodeMarkup()
-            else:
-                return None
+            self.ast_cache[func_addr] = function_c_markup
                 
         return self.ast_cache[func_addr]
     
@@ -182,36 +178,25 @@ class ASTPatternEngine:
             print("Pattern type: {}".format(pattern_type))
             print("Constraints: {}".format(kwargs))
         
-        # Get all functions in the program
-        function_manager = currentProgram.getFunctionManager()
-        functions = function_manager.getFunctions(True)  # True = forward iteration
+        func = currentLocation.decompile.function
         
-        func_count = 0
-        for func in functions:
-            if monitor.isCancelled():
-                break
-            
-            func_count += 1
-            ast = self.get_ast(func)
-            if ast:
-                self.current_function = func
-                
-                if self.debug and func_count <= 5:  # Only debug first 5 functions
-                    print("\nProcessing function: {}".format(func.getName()))
-                
-                if pattern_type == 'assignment':
-                    self._find_assignments_in_ast(ast, **kwargs)
-                elif pattern_type == 'function_call':
-                    self._find_function_calls_in_ast(ast, **kwargs)
-                elif pattern_type == 'variable':
-                    self._find_variables_in_ast(ast, **kwargs)
-                elif pattern_type == 'operator':
-                    self._find_operators_in_ast(ast, **kwargs)
-                elif pattern_type == 'control_flow':
-                    self._find_control_flow_in_ast(ast, **kwargs)
+        ast = self.get_ast(func.getEntryPoint(), currentLocation.getDecompile().cCodeMarkup)
+        if ast:
+            self.current_function = func
+
+            self.traverse_ast(ast, lambda a,b,c: print(a,b,c))
+            if pattern_type == 'assignment':
+                self._find_assignments_in_ast(ast, **kwargs)
+            elif pattern_type == 'function_call':
+                self._find_function_calls_in_ast(ast, **kwargs)
+            elif pattern_type == 'variable':
+                self._find_variables_in_ast(ast, **kwargs)
+            elif pattern_type == 'operator':
+                self._find_operators_in_ast(ast, **kwargs)
+            elif pattern_type == 'control_flow':
+                self._find_control_flow_in_ast(ast, **kwargs)
         
         if self.debug:
-            print("\nTotal functions processed: {}".format(func_count))
             print("Total results found: {}".format(len(self.results)))
             print("=== Search complete ===\n")
         
@@ -885,7 +870,6 @@ class ASTQueryPanel:
             print("Constraints: {}".format(parsed_query.constraints))
             
             self.results = self.engine.find_pattern(parsed_query.type, **parsed_query.constraints)
-            
             # Populate table
             for i, result in enumerate(self.results):
                 row_data = [
