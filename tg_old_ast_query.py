@@ -92,11 +92,19 @@ class Pattern:
         self.negated = False
         self.next_sibling = None  # For sequential patterns
         self.alternatives = []  # For OR patterns
+        self.strict = False  # Strict matching mode
+        self.not_pattern = None  # For NOT: patterns
         
     def matches(self, token_wrapper, captures=None):
         """Check if this pattern matches the given token"""
         if captures is None:
             captures = {}
+        
+        # Handle NOT patterns first
+        if self.not_pattern:
+            not_captures = dict(captures)
+            if self.not_pattern.matches(token_wrapper, not_captures):
+                return False  # If NOT pattern matches, this pattern fails
             
         # Handle wildcards
         if self.wildcard:
@@ -127,23 +135,23 @@ class Pattern:
         if 'text' in self.constraints:
             pattern_text = self.constraints['text']
             if pattern_text.startswith('$'):
-                # Capture
+                # Variable capture
                 cap_name = pattern_text[1:]
                 if cap_name in captures:
                     if captures[cap_name] != token_wrapper.text:
                         return False
                 else:
                     captures[cap_name] = token_wrapper.text
-            elif pattern_text != '_':
+            elif pattern_text == '_':
+                # Wildcard - matches anything
+                return True
+            elif pattern_text.startswith('_(') and pattern_text.endswith(')'):
+                # Subexpression wildcard _(..)
+                inner_pattern = pattern_text[2:-1]
+                return self._match_subexpression(token_wrapper, inner_pattern, captures)
+            else:
                 # Literal or regex match
                 if not self._matches_text(pattern_text, token_wrapper.text):
-                    return False
-        
-        # Attribute constraints (e.g., @type="int")
-        for attr, value in self.constraints.items():
-            if attr.startswith('@') and attr != '@type':
-                # Custom attribute matching
-                if not self._match_attribute(token_wrapper, attr[1:], value):
                     return False
         
         # Match children if specified
@@ -153,6 +161,15 @@ class Pattern:
                 return False
                 
         return True
+    
+    def _match_subexpression(self, token_wrapper, pattern, captures):
+        """Match subexpression patterns like _(test) """
+        # This would match any expression containing the pattern
+        # For now, simple text search within the expression
+        if hasattr(token_wrapper.token, 'toString'):
+            expr_text = token_wrapper.token.toString()
+            return pattern in expr_text
+        return False
     
     def _matches_text(self, pattern, text):
         """Check if text matches pattern (supports wildcards and regex)"""
@@ -198,78 +215,123 @@ class Pattern:
         return True
 
 class QueryCompiler:
-    """Compiles query strings into Pattern objects"""
+    """Compiles C-like query strings into Pattern objects"""
     
     def __init__(self):
         self.tokens = []
         self.pos = 0
+        self.strict_mode = False
         
     def compile(self, query_str):
-        """Compile a query string into a Pattern tree"""
-        print("Compiling query: '{}'".format(query_str))
-        self.tokens = self._tokenize(query_str)
+        """Compile a C-like query string into a Pattern tree"""
+        print("Compiling C-like query: '{}'".format(query_str))
+        
+        # Check for special directives
+        if query_str.strip().startswith('strict:'):
+            self.strict_mode = True
+            query_str = query_str.replace('strict:', '').strip()
+            print("Strict mode enabled")
+        
+        # Handle NOT: patterns
+        if 'NOT:' in query_str or 'not:' in query_str:
+            return self._parse_not_pattern(query_str)
+        
+        self.tokens = self._tokenize_c_like(query_str)
         print("Tokens: {}".format(self.tokens))
         self.pos = 0
-        pattern = self._parse_expression()
+        pattern = self._parse_c_expression()
+        
         if pattern:
             print("Compiled pattern type: {}, constraints: {}".format(pattern.type, pattern.constraints))
         return pattern
     
-    def _tokenize(self, query_str):
-        """Enhanced tokenizer with more operators"""
+    def _parse_not_pattern(self, query_str):
+        """Parse patterns with NOT: clauses"""
+        # Split by NOT: or not:
+        import re
+        parts = re.split(r'(?i)\s*not:\s*', query_str)
+        
+        if len(parts) == 1:
+            # No NOT clause, parse normally
+            return self.compile(parts[0])
+        
+        # Create main pattern from first part
+        main_pattern = self.compile(parts[0].strip()) if parts[0].strip() else None
+        
+        # Create NOT patterns from remaining parts
+        for not_part in parts[1:]:
+            if not_part.strip():
+                not_pattern = self.compile(not_part.strip())
+                if main_pattern:
+                    main_pattern.not_pattern = not_pattern
+                else:
+                    # If no main pattern, create a wildcard with NOT
+                    main_pattern = Pattern('_')
+                    main_pattern.wildcard = True
+                    main_pattern.not_pattern = not_pattern
+                break  # For now, handle only one NOT clause
+        
+        return main_pattern
+    
+    def _tokenize_c_like(self, query_str):
+        """Enhanced tokenizer for C-like syntax"""
         tokens = []
         current = ""
         in_string = False
-        in_regex = False
+        in_char = False
         
         i = 0
         while i < len(query_str):
             char = query_str[i]
             
-            # Handle regex patterns /pattern/
-            if char == '/' and not in_string:
-                if in_regex:
+            # Handle string literals
+            if char == '"' and not in_char:
+                if in_string:
                     current += char
                     tokens.append(current)
                     current = ""
-                    in_regex = False
+                    in_string = False
                 else:
                     if current:
                         tokens.append(current)
                         current = ""
                     current += char
-                    in_regex = True
-            elif in_regex:
-                current += char
-            # Handle strings
-            elif char == '"' and (i == 0 or query_str[i-1] != '\\'):
-                in_string = not in_string
-                if current:
-                    tokens.append(current)
-                    current = ""
+                    in_string = True
             elif in_string:
                 current += char
-            # Handle operators
-            elif i + 1 < len(query_str) and query_str[i:i+2] in ['&&', '||', '!=', '==', '<=', '>=', '<<', '>>']:
+            # Handle char literals
+            elif char == "'" and not in_string:
+                if in_char:
+                    current += char
+                    tokens.append(current)
+                    current = ""
+                    in_char = False
+                else:
+                    if current:
+                        tokens.append(current)
+                        current = ""
+                    current += char
+                    in_char = True
+            elif in_char:
+                current += char
+            # Handle multi-character operators
+            elif i + 1 < len(query_str) and query_str[i:i+2] in ['==', '!=', '<=', '>=', '->', '&&', '||', '++', '--', '<<', '>>', '+=', '-=', '*=', '/=']:
                 if current:
                     tokens.append(current)
                     current = ""
                 tokens.append(query_str[i:i+2])
                 i += 1  # Skip next char
-            elif char in '()[]{}@!':
+            # Handle single character tokens
+            elif char in '(){}[];,=<>!&|+-*/%^~.':
                 if current:
                     tokens.append(current)
                     current = ""
                 tokens.append(char)
-            elif char in ' \t\n':
+            # Handle whitespace
+            elif char in ' \t\n\r':
                 if current:
                     tokens.append(current)
                     current = ""
-            elif char == ',' or char == ';':
-                if current:
-                    tokens.append(current)
-                    current = ""
-                tokens.append(char)
             else:
                 current += char
             
@@ -280,121 +342,259 @@ class QueryCompiler:
             
         return tokens
     
-    def _parse_expression(self):
-        """Parse expressions with AND/OR/NOT logic"""
-        left = self._parse_term()
+    def _parse_c_expression(self):
+        """Parse C-like expressions"""
+        return self._parse_assignment()
+    
+    def _parse_assignment(self):
+        """Parse assignment expressions"""
+        left = self._parse_logical_or()
         
-        while self.pos < len(self.tokens) and self.tokens[self.pos] in ['&&', '||']:
+        if self.pos < len(self.tokens) and self.tokens[self.pos] in ['=', '+=', '-=', '*=', '/=']:
             op = self.tokens[self.pos]
             self.pos += 1
-            right = self._parse_term()
+            right = self._parse_assignment()
             
-            if op == '&&':
-                # Create AND pattern
-                and_pattern = Pattern('AND')
-                and_pattern.type = 'and'
-                and_pattern.children = [left, right]
-                left = and_pattern
-            else:  # ||
-                # Add as alternative
-                if not left.alternatives:
-                    left.alternatives = []
-                left.alternatives.append(right)
+            pattern = Pattern('{} {} {}'.format(left.raw if left else '', op, right.raw if right else ''))
+            pattern.type = 'assignment' if op == '=' else 'compound_assignment'
+            pattern.children = [left, right] if left and right else []
+            return pattern
         
         return left
     
-    def _parse_term(self):
-        """Parse a single term with possible negation"""
-        if self.pos < len(self.tokens) and self.tokens[self.pos] in ['!', 'NOT']:
+    def _parse_logical_or(self):
+        """Parse logical OR expressions"""
+        left = self._parse_logical_and()
+        
+        while self.pos < len(self.tokens) and self.tokens[self.pos] == '||':
             self.pos += 1
-            pattern = self._parse_pattern()
-            if pattern:
-                pattern.negated = True
+            right = self._parse_logical_and()
+            
+            if not left.alternatives:
+                left.alternatives = []
+            left.alternatives.append(right)
+        
+        return left
+    
+    def _parse_logical_and(self):
+        """Parse logical AND expressions"""
+        left = self._parse_equality()
+        
+        while self.pos < len(self.tokens) and self.tokens[self.pos] == '&&':
+            self.pos += 1
+            right = self._parse_equality()
+            
+            and_pattern = Pattern('AND')
+            and_pattern.type = 'and'
+            and_pattern.children = [left, right]
+            left = and_pattern
+        
+        return left
+    
+    def _parse_equality(self):
+        """Parse equality expressions"""
+        left = self._parse_relational()
+        
+        if self.pos < len(self.tokens) and self.tokens[self.pos] in ['==', '!=']:
+            op = self.tokens[self.pos]
+            self.pos += 1
+            right = self._parse_relational()
+            
+            pattern = Pattern('{} {} {}'.format(left.raw if left else '', op, right.raw if right else ''))
+            pattern.type = 'comparison'
+            pattern.constraints['operator'] = op
+            pattern.children = [left, right] if left and right else []
             return pattern
         
-        return self._parse_pattern()
+        return left
     
-    def _parse_pattern(self):
-        """Parse a pattern from tokens"""
+    def _parse_relational(self):
+        """Parse relational expressions"""
+        return self._parse_additive()
+    
+    def _parse_additive(self):
+        """Parse additive expressions"""
+        return self._parse_multiplicative()
+    
+    def _parse_multiplicative(self):
+        """Parse multiplicative expressions"""
+        return self._parse_unary()
+    
+    def _parse_unary(self):
+        """Parse unary expressions"""
+        if self.pos < len(self.tokens) and self.tokens[self.pos] in ['!', '~', '-', '+', '*', '&']:
+            op = self.tokens[self.pos]
+            self.pos += 1
+            operand = self._parse_postfix()
+            
+            if op == '!':
+                # Negation
+                if operand:
+                    operand.negated = True
+                return operand
+            else:
+                pattern = Pattern(op + (operand.raw if operand else ''))
+                pattern.type = 'unary'
+                pattern.constraints['operator'] = op
+                if operand:
+                    pattern.children = [operand]
+                return pattern
+        
+        return self._parse_postfix()
+    
+    def _parse_postfix(self):
+        """Parse postfix expressions"""
+        left = self._parse_primary()
+        
+        while self.pos < len(self.tokens):
+            if self.tokens[self.pos] == '(':
+                # Function call
+                return self._parse_function_call_from_primary(left)
+            elif self.tokens[self.pos] == '[':
+                # Array access
+                self.pos += 1
+                index = self._parse_c_expression()
+                if self.pos < len(self.tokens) and self.tokens[self.pos] == ']':
+                    self.pos += 1
+                
+                pattern = Pattern('{}[{}]'.format(left.raw if left else '', index.raw if index else ''))
+                pattern.type = 'array_access'
+                pattern.children = [left, index] if left and index else []
+                left = pattern
+            elif self.tokens[self.pos] in ['->', '.']:
+                # Member access
+                op = self.tokens[self.pos]
+                self.pos += 1
+                if self.pos < len(self.tokens):
+                    member = self._parse_primary()
+                    pattern = Pattern('{}{}{}'.format(left.raw if left else '', op, member.raw if member else ''))
+                    pattern.type = 'member_access'
+                    pattern.children = [left, member] if left and member else []
+                    left = pattern
+                else:
+                    break
+            else:
+                break
+        
+        return left
+    
+    def _parse_primary(self):
+        """Parse primary expressions"""
         if self.pos >= len(self.tokens):
             return None
-            
-        token = self.tokens[self.pos]
-        print("Parsing token: '{}'".format(token))
         
-        # Handle parentheses for grouping
+        token = self.tokens[self.pos]
+        
+        # Handle parentheses
         if token == '(':
             self.pos += 1
-            pattern = self._parse_expression()
+            expr = self._parse_c_expression()
             if self.pos < len(self.tokens) and self.tokens[self.pos] == ')':
                 self.pos += 1
-            return pattern
+            return expr
         
-        # Handle special tokens
+        # Handle braces for compound statements
+        if token == '{':
+            return self._parse_compound_statement()
+        
+        # Handle wildcards
         if token == '_':
             self.pos += 1
             pattern = Pattern('_')
             pattern.wildcard = True
             return pattern
         
-        # Handle attributes (@type="int")
-        if token == '@':
-            return self._parse_attribute()
+        # Handle subexpression wildcards
+        if token.startswith('_(') and token.endswith(')'):
+            self.pos += 1
+            pattern = Pattern(token)
+            pattern.wildcard = True
+            pattern.constraints['text'] = token
+            return pattern
         
-        # Handle function calls
+        # Handle variables
+        if token.startswith('$'):
+            self.pos += 1
+            pattern = Pattern(token)
+            pattern.constraints['text'] = token
+            return pattern
+        
+        # Handle function calls (lookahead)
         if self.pos + 1 < len(self.tokens) and self.tokens[self.pos + 1] == '(':
             return self._parse_function_call()
         
-        # Handle operators
-        if token in ['=', '==', '!=', '<', '>', '<=', '>=', '+', '-', '*', '/', '%', '<<', '>>', '&', '|', '^']:
-            return self._parse_operator()
-        
-        # Handle control flow
-        if token in ['if', 'while', 'for', 'switch', 'do', 'return']:
-            return self._parse_control_flow()
-        
-        # Default: variable or identifier
-        pattern = Pattern(token)
-        if token.startswith('$'):
-            # Capture variable
-            pattern.constraints['text'] = token
-        elif token.startswith('/') and token.endswith('/'):
-            # Regex pattern
-            pattern.constraints['text'] = token
-        else:
-            # Literal match
-            pattern.constraints['text'] = token
-        
+        # Handle literals and identifiers
         self.pos += 1
+        pattern = Pattern(token)
+        
+        # Determine pattern type based on token
+        if token.isdigit() or (token.startswith('0x') and len(token) > 2):
+            pattern.type = 'constant'
+        elif token.startswith('"') and token.endswith('"'):
+            pattern.type = 'string_literal'
+        elif token.startswith("'") and token.endswith("'"):
+            pattern.type = 'char_literal'
+        elif token in ['if', 'while', 'for', 'switch', 'do', 'return', 'break', 'continue']:
+            pattern.type = 'control_flow'
+        elif token in ['int', 'char', 'void', 'float', 'double', 'short', 'long', 'unsigned', 'signed']:
+            pattern.type = 'type'
+        else:
+            # Default to identifier/variable
+            pattern.type = None  # Let token wrapper determine
+        
+        pattern.constraints['text'] = token
         return pattern
     
-    def _parse_attribute(self):
-        """Parse attribute patterns like @type="int" """
-        self.pos += 1  # Skip @
-        if self.pos >= len(self.tokens):
+    def _parse_compound_statement(self):
+        """Parse compound statements { ... }"""
+        if self.pos >= len(self.tokens) or self.tokens[self.pos] != '{':
             return None
+        
+        self.pos += 1  # Skip '{'
+        statements = []
+        
+        while self.pos < len(self.tokens) and self.tokens[self.pos] != '}':
+            stmt = self._parse_c_expression()
+            if stmt:
+                statements.append(stmt)
             
-        attr_name = self.tokens[self.pos]
-        self.pos += 1
-        
-        pattern = Pattern('@' + attr_name)
-        
-        if self.pos < len(self.tokens) and self.tokens[self.pos] == '=':
-            self.pos += 1
-            if self.pos < len(self.tokens):
-                pattern.constraints['@' + attr_name] = self.tokens[self.pos]
+            # Skip semicolons
+            if self.pos < len(self.tokens) and self.tokens[self.pos] == ';':
                 self.pos += 1
         
+        if self.pos < len(self.tokens) and self.tokens[self.pos] == '}':
+            self.pos += 1  # Skip '}'
+        
+        pattern = Pattern('{ ... }')
+        pattern.type = 'compound'
+        pattern.children = statements
         return pattern
     
     def _parse_function_call(self):
-        """Parse a function call pattern"""
+        """Parse function call patterns"""
         func_name = self.tokens[self.pos]
-        print("Parsing function call: {}".format(func_name))
         self.pos += 1  # Skip function name
+        
+        if self.pos >= len(self.tokens) or self.tokens[self.pos] != '(':
+            # Not a function call, backtrack
+            self.pos -= 1
+            return self._parse_primary()
+        
+        return self._parse_function_call_from_name(func_name)
+    
+    def _parse_function_call_from_primary(self, func_pattern):
+        """Parse function call from existing primary expression"""
+        if not func_pattern:
+            return None
+        
+        func_name = func_pattern.raw
+        return self._parse_function_call_from_name(func_name)
+    
+    def _parse_function_call_from_name(self, func_name):
+        """Parse function call given the function name"""
         self.pos += 1  # Skip '('
         
-        pattern = Pattern(func_name + '(...)')
+        pattern = Pattern('{}(...)'.format(func_name))
         pattern.type = 'function_name'  # Match against function name tokens
         pattern.constraints['text'] = func_name
         
@@ -405,48 +605,15 @@ class QueryCompiler:
                 self.pos += 1
                 continue
             
-            arg_pattern = self._parse_pattern()
+            arg_pattern = self._parse_c_expression()
             if arg_pattern:
                 args.append(arg_pattern)
         
         pattern.constraints['arguments'] = args
+        pattern.children = args
         
         if self.pos < len(self.tokens) and self.tokens[self.pos] == ')':
             self.pos += 1
-        
-        return pattern
-    
-    def _parse_operator(self):
-        """Parse an operator pattern"""
-        op = self.tokens[self.pos]
-        self.pos += 1
-        
-        pattern = Pattern(op)
-        pattern.type = 'operator'
-        pattern.constraints['operator'] = op
-        
-        # For binary operators, we'd parse left and right operands
-        # This is simplified for now
-        
-        return pattern
-    
-    def _parse_control_flow(self):
-        """Parse a control flow pattern"""
-        keyword = self.tokens[self.pos]
-        self.pos += 1
-        
-        pattern = Pattern(keyword)
-        pattern.type = 'control_flow'
-        pattern.constraints['keyword'] = keyword
-        
-        # Parse condition if present
-        if self.pos < len(self.tokens) and self.tokens[self.pos] == '(':
-            self.pos += 1
-            condition = self._parse_pattern()
-            pattern.constraints['condition'] = condition
-            
-            if self.pos < len(self.tokens) and self.tokens[self.pos] == ')':
-                self.pos += 1
         
         return pattern
 
@@ -711,16 +878,20 @@ class ASTQueryPanel:
         top_panel.add(highlight_btn)
         top_panel.add(clear_btn)
         
-        # Help text
-        help_text = JTextArea(7, 60)
+        # Help text with C-like examples
+        help_text = JTextArea(10, 60)
         help_text.setText(
-            "Query Syntax Examples:\n" +
-            "  strcmp         - Find all strcmp function calls\n" +
-            "  malloc && !free - Find malloc without corresponding free\n" +
-            "  /buff.*/ = _   - Find assignments to variables matching regex\n" +
-            "  $var || $ptr   - Match variables named 'var' OR 'ptr'\n" +
-            "  !if            - Find code NOT in if statements\n" +
-            "  return $val    - Find return statements, capture value"
+            "C-like Query Syntax Examples:\n" +
+            "  malloc($size)           - Find malloc calls, capture size argument\n" +
+            "  { _ $buf[_]; memcpy($buf,_,_); }  - Stack buffer with memcpy\n" +
+            "  $x = $y                 - Find all assignments\n" +
+            "  if ($cond) { $body }    - Find if statements\n" +
+            "  strict: func();         - Exact function call matching only\n" +
+            "  NOT: $ptr == NULL       - Find code without NULL checks\n" +
+            "  $func(_); NOT: if(_)    - Function calls not in if statements\n" +
+            "  $ret = snprintf($buf,_,_); $buf[$ret] = _;  - Potential buffer issues\n" +
+            "  _($test)                - Any expression involving 'test'\n" +
+            "  { _* $p; NOT: $p = _; $func(&$p); }  - Uninitialized pointers"
         )
         help_text.setEditable(False)
         help_text.setBackground(self.panel.getBackground())
