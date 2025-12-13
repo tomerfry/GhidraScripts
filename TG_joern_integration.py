@@ -71,6 +71,51 @@ def _to_posix_path(p: Path) -> str:
 
 
 # -----------------------------
+# Joern user scripts configuration
+# -----------------------------
+
+# Folder where you keep your custom Joern scripts.
+# You can override it with an environment variable:
+#   setx JOERN_SCRIPTS_DIR "C:\path\to\joern-scripts"
+JOERN_SCRIPTS_DIR = Path(os.environ.get(
+    "JOERN_SCRIPTS_DIR",
+    r"C:\Users\User\Desktop\Profession\GhidraScripts\joern-scripts"
+))
+
+
+# Which scripts to auto-import on startup (comma-separated).
+# Override with:
+#   setx JOERN_AUTO_IMPORT "uaf_heuristic.sc"
+JOERN_AUTO_IMPORT = [
+    s.strip() for s in os.environ.get("JOERN_AUTO_IMPORT", "uaf_heuristic.sc,primitives.sc").split(",")
+    if s.strip()
+]
+
+
+def build_joern_predef(workspace: Path, scripts_dir: Path, scripts: list[str]) -> Path:
+    """
+    Create a predef script that imports your custom scripts via scala-cli directives.
+    Joern's --import compiles these and makes their objects available in the REPL.
+    """
+    predef = workspace / "joern_predef.sc"
+    lines = []
+
+    if not scripts_dir.exists():
+        print(f"[!] JOERN_SCRIPTS_DIR does not exist: {scripts_dir}")
+    else:
+        for name in scripts:
+            p = (scripts_dir / name).resolve()
+            if p.exists():
+                # Use forward slashes so Joern/Scala won't trip over backslashes
+                lines.append(f"//> using file {_to_posix_path(p)}")
+            else:
+                print(f"[!] Script not found: {p}")
+
+    predef.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return predef
+
+
+# -----------------------------
 # Ghidra exporter
 # -----------------------------
 class GhidraExporter:
@@ -267,16 +312,16 @@ class JoernInterface:
 # -----------------------------
 # Joern launcher
 # -----------------------------
-def launch_joern_terminal(joern_bin: str, cpg_path: Path, program_name: str):
+def launch_joern_terminal(joern_bin: str, cpg_path: Path, program_name: str, predef: Path | None = None):
     """
-    Launch Joern with the CPG loaded using --runBefore 'importCpg("...")'.
-
-    Windows strategy:
-      - If joern_bin is an .exe: spawn in a new console with argv list (no quoting issues).
-      - If joern_bin is .bat/.cmd: use cmd.exe /k with careful quoting.
+    Launch Joern with the CPG loaded using --runBefore 'importCpg("...")'
+    and optionally auto-import custom scripts via --import predef.sc.
     """
     cpg_posix = _to_posix_path(Path(cpg_path))
     scala_stmt = f'importCpg("{cpg_posix}")'
+
+    is_windows = (os.name == "nt")
+    jb = str(joern_bin)
 
     print("")
     print("=" * 60)
@@ -284,46 +329,38 @@ def launch_joern_terminal(joern_bin: str, cpg_path: Path, program_name: str):
     print("=" * 60)
     print("")
 
-    is_windows = (os.name == "nt")
-    jb = str(joern_bin)
+    # Build common argv
+    argv = [jb]
+    if predef is not None and Path(predef).exists():
+        argv += ["--import", str(predef)]
+    argv += ["--runBefore", scala_stmt]
 
     if is_windows:
         lower = jb.lower()
         if lower.endswith((".bat", ".cmd")):
-            # cmd.exe needs doubled quotes to embed literal quotes inside a quoted argument
-            # We want: --runBefore "importCpg("C:/...")"
-            # cmd representation: --runBefore "importCpg(""C:/..."" )" (no space in actual)
+            # Need cmd.exe quoting; also keep Scala statement safe
             run_before = f'importCpg(""{cpg_posix}"")'
-            title = f'Joern - {program_name}'
-            cmd = f'start "{title}" cmd /k ""{jb}" --runBefore "{run_before}""'
+
+            import_part = ""
+            if predef is not None and Path(predef).exists():
+                import_part = f' --import "{predef}"'
+
+            title = f"Joern - {program_name}"
+            cmd = f'start "{title}" cmd /k ""{jb}"{import_part} --runBefore "{run_before}""'
             subprocess.Popen(cmd, shell=True)
         else:
-            # Best-case: native exe, pass argv list, create a new console
-            args = [jb, "--runBefore", scala_stmt]
+            # Native exe: pass argv list, avoid quoting issues
             try:
                 CREATE_NEW_CONSOLE = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
-                subprocess.Popen(args, creationflags=CREATE_NEW_CONSOLE)
+                subprocess.Popen(argv, creationflags=CREATE_NEW_CONSOLE)
             except Exception:
-                # Fallback if CREATE_NEW_CONSOLE is unavailable
-                subprocess.Popen(args)
+                subprocess.Popen(argv)
 
         print("[+] Joern launched")
         return
 
-    # Linux/macOS: try common terminals; fallback to direct run
-    terminals = [
-        ["gnome-terminal", "--title", f"Joern - {program_name}", "--", jb, "--runBefore", scala_stmt],
-        ["xterm", "-T", f"Joern - {program_name}", "-e", jb, "--runBefore", scala_stmt],
-        ["konsole", "--new-tab", "-p", f"tabtitle=Joern - {program_name}", "-e", jb, "--runBefore", scala_stmt],
-    ]
-
-    for term_cmd in terminals:
-        if shutil.which(term_cmd[0]):
-            subprocess.Popen(term_cmd)
-            print("[+] Joern launched")
-            return
-
-    subprocess.Popen([jb, "--runBefore", scala_stmt])
+    # Linux/macOS: direct run (or wrap in terminal if you want)
+    subprocess.Popen(argv)
     print("[+] Joern launched")
 
 
@@ -365,9 +402,12 @@ def main():
             joern.create_cpg(decompiled_file, cpg_path)
 
         # Launch Joern
-        joern = JoernInterface()
-        launch_joern_terminal(joern.joern_bin, cpg_path, program_name)
+        # Build predef that auto-loads your custom scripts
+        predef = build_joern_predef(workspace, JOERN_SCRIPTS_DIR, JOERN_AUTO_IMPORT)
 
+        # Launch Joern with CPG + your predef imports
+        joern = JoernInterface()
+        launch_joern_terminal(joern.joern_bin, cpg_path, program_name, predef=predef)
         print(f"\n[*] Workspace: {workspace}")
         return 0
 
