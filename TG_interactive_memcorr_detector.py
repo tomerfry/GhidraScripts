@@ -795,6 +795,9 @@ class InteractiveMemcorrDetector:
                 self._check_format_string(op, func, param_idx, addr)
             elif sink_type == "FREE":
                 self._check_free(op, func, freed_ptrs, param_idx, addr)
+            
+            # Check for integer overflow in allocation
+            self._check_alloc_overflow(op, func, addr)
     
     def _check_unbounded_overflow(self, op, func, dst_idx, addr):
         """Check unbounded copy operations"""
@@ -921,6 +924,76 @@ class InteractiveMemcorrDetector:
             self._add_finding(func.getName(), addr, "DOUBLE_FREE", "HIGH", details)
         else:
             freed_ptrs[ptr_key] = addr
+    
+    def _check_alloc_overflow(self, op, func, addr):
+        """Check for integer overflow in allocation size (malloc(a*b*c) pattern)"""
+        name, classification = self.tracker.get_call_info(op)
+        if not classification:
+            return
+        
+        traits = classification.get("traits", [])
+        params = classification.get("params", {})
+        
+        # Only check allocation functions
+        if "ALLOC_RETURN" not in traits or "SIZE_FROM_PARAM" not in traits:
+            return
+        
+        size_idx = params.get("SIZE_FROM_PARAM", 0)
+        if op.getNumInputs() <= size_idx + 1:
+            return
+        
+        size_vn = op.getInput(size_idx + 1)
+        size_origin = self.tracker.trace_origin(size_vn)
+        
+        # Check if size comes from multiplication of tainted values
+        if size_origin.get("type") == "ARITH" and size_origin.get("tainted"):
+            # Look for multiplication pattern with tainted operands
+            left = size_origin.get("left", {})
+            right = size_origin.get("right", {})
+            
+            # Count tainted operands in multiplication chain
+            tainted_factors = self._count_tainted_factors(size_origin)
+            
+            if tainted_factors >= 2:
+                details = "{}(size={}) - {} tainted factors multiplied, no overflow check".format(
+                    name, self.tracker.origin_str(size_origin), tainted_factors)
+                self._add_finding(func.getName(), addr, "INTEGER_OVERFLOW_ALLOC", "HIGH", details)
+            elif tainted_factors == 1 and self._has_multiplication(size_origin):
+                # Single tainted factor in multiplication - still risky
+                details = "{}(size={}) - tainted value in size calculation".format(
+                    name, self.tracker.origin_str(size_origin))
+                self._add_finding(func.getName(), addr, "INTEGER_OVERFLOW_ALLOC", "MEDIUM", details)
+    
+    def _count_tainted_factors(self, origin, depth=0):
+        """Count tainted factors in a multiplication chain"""
+        if depth > 8 or not origin:
+            return 0
+        
+        if origin.get("type") == "ARITH":
+            left = origin.get("left", {})
+            right = origin.get("right", {})
+            return self._count_tainted_factors(left, depth+1) + self._count_tainted_factors(right, depth+1)
+        
+        if origin.get("tainted"):
+            return 1
+        return 0
+    
+    def _has_multiplication(self, origin, depth=0):
+        """Check if origin involves multiplication"""
+        if depth > 8 or not origin:
+            return False
+        
+        if origin.get("type") == "ARITH":
+            # Check if this is multiplication (we track all arith the same, so assume yes if nested)
+            left = origin.get("left", {})
+            right = origin.get("right", {})
+            if left.get("type") == "ARITH" or right.get("type") == "ARITH":
+                return True
+            if left.get("tainted") and right.get("type") != "CONST":
+                return True
+            if right.get("tainted") and left.get("type") != "CONST":
+                return True
+        return False
     
     def _add_finding(self, func_name, addr, vuln_type, severity, details):
         self.findings.append({
