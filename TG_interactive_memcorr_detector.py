@@ -1,46 +1,69 @@
-# Memory Corruption Detector v8.0 - CALLIND Support
+# Memory Corruption Detector v9.0 - Reduced False Positives
 # @category Security
 # @runtime PyGhidra
 
 from ghidra.app.decompiler import DecompInterface
 from ghidra.util.task import TaskMonitor
 from ghidra.program.model.pcode import PcodeOp
-from collections import defaultdict
+from ghidra.program.model.listing import CodeUnit
 import json
 import os
 
-CONFIG = {
-    "max_trace_depth": 15,
-}
+CONFIG = {"max_trace_depth": 15}
 
 KNOWN_EXTERNALS = {
+    # Taint sources - user controlled input
     "getenv": {"traits": ["TAINT_RETURN"]},
     "recv": {"traits": ["TAINT_RETURN", "TAINT_PARAM"], "params": {"TAINT_PARAM": 1}},
     "read": {"traits": ["TAINT_RETURN", "TAINT_PARAM"], "params": {"TAINT_PARAM": 1}},
     "fgets": {"traits": ["TAINT_RETURN", "TAINT_PARAM"], "params": {"TAINT_PARAM": 0}},
     "fread": {"traits": ["TAINT_PARAM"], "params": {"TAINT_PARAM": 0}},
     "gets": {"traits": ["TAINT_PARAM", "COPY_UNBOUNDED"], "params": {"TAINT_PARAM": 0, "COPY_UNBOUNDED": 0}},
+    "scanf": {"traits": ["TAINT_PARAM"], "params": {"TAINT_PARAM": 1}},
+    "fscanf": {"traits": ["TAINT_PARAM"], "params": {"TAINT_PARAM": 2}},
+    "sscanf": {"traits": ["TAINT_PARAM"], "params": {"TAINT_PARAM": 2}},
     
+    # Dangerous sinks - unbounded copy
     "strcpy": {"traits": ["COPY_UNBOUNDED"], "params": {"COPY_UNBOUNDED": 0}},
     "strcat": {"traits": ["COPY_UNBOUNDED"], "params": {"COPY_UNBOUNDED": 0}},
     "sprintf": {"traits": ["COPY_UNBOUNDED", "FORMAT_SINK"], "params": {"COPY_UNBOUNDED": 0, "FORMAT_SINK": 1}},
     "vsprintf": {"traits": ["COPY_UNBOUNDED", "FORMAT_SINK"], "params": {"COPY_UNBOUNDED": 0, "FORMAT_SINK": 1}},
+    "wcscpy": {"traits": ["COPY_UNBOUNDED"], "params": {"COPY_UNBOUNDED": 0}},
+    "wcscat": {"traits": ["COPY_UNBOUNDED"], "params": {"COPY_UNBOUNDED": 0}},
     
+    # Bounded copies (lower priority)
     "strncpy": {"traits": ["COPY_BOUNDED"], "params": {"COPY_BOUNDED": 0}},
+    "strncat": {"traits": ["COPY_BOUNDED"], "params": {"COPY_BOUNDED": 0}},
     "snprintf": {"traits": ["COPY_BOUNDED", "FORMAT_SINK"], "params": {"COPY_BOUNDED": 0, "FORMAT_SINK": 2}},
     "memcpy": {"traits": ["COPY_BOUNDED"], "params": {"COPY_BOUNDED": 0}},
+    "memmove": {"traits": ["COPY_BOUNDED"], "params": {"COPY_BOUNDED": 0}},
     
+    # Format sinks
     "printf": {"traits": ["FORMAT_SINK"], "params": {"FORMAT_SINK": 0}},
     "fprintf": {"traits": ["FORMAT_SINK"], "params": {"FORMAT_SINK": 1}},
+    "vprintf": {"traits": ["FORMAT_SINK"], "params": {"FORMAT_SINK": 0}},
+    "vfprintf": {"traits": ["FORMAT_SINK"], "params": {"FORMAT_SINK": 1}},
+    "syslog": {"traits": ["FORMAT_SINK"], "params": {"FORMAT_SINK": 1}},
     
+    # Memory management
     "free": {"traits": ["FREE_PTR"], "params": {"FREE_PTR": 0}},
-    "malloc": {"traits": ["ALLOC_RETURN", "SIZE_FROM_PARAM"], "params": {"SIZE_FROM_PARAM": 0}},
+    "malloc": {"traits": ["ALLOC_RETURN"], "params": {}},
+    "realloc": {"traits": ["FREE_PTR", "ALLOC_RETURN"], "params": {"FREE_PTR": 0}},
     
+    # Safe / ignore
     "strlen": {"traits": ["SIZE_CALC"]},
     "strcmp": {"traits": ["SAFE_IGNORE"]},
+    "strncmp": {"traits": ["SAFE_IGNORE"]},
     "memset": {"traits": ["SAFE_IGNORE"]},
+    "memcmp": {"traits": ["SAFE_IGNORE"]},
+    "puts": {"traits": ["SAFE_IGNORE"]},
+    "exit": {"traits": ["SAFE_IGNORE"]},
+    
+    # Taint propagators
     "split": {"traits": ["TAINT_PARAM"], "params": {"TAINT_PARAM": 0}},
     "strtok": {"traits": ["TAINT_RETURN"]},
+    "strtok_r": {"traits": ["TAINT_RETURN"]},
+    "strdup": {"traits": ["TAINT_RETURN"]},  # If input tainted, output tainted
 }
 
 
@@ -60,7 +83,7 @@ class ExternalFunctionDB:
         return self.db.get(func_name) or self.db.get(normalized)
 
 
-class MemcorrDetectorV8:
+class MemcorrDetectorV9:
     def __init__(self):
         self.extern_db = ExternalFunctionDB()
         self.decomplib = DecompInterface()
@@ -69,10 +92,73 @@ class MemcorrDetectorV8:
         self.thunk_map = {}
         self.got_map = {}
         self._build_call_maps()
+        
+        # Cache for rodata section bounds
+        self.rodata_ranges = []
+        self._find_rodata_sections()
+    
+    def _find_rodata_sections(self):
+        """Find read-only data sections to identify constant strings"""
+        mem = currentProgram.getMemory()
+        for block in mem.getBlocks():
+            name = block.getName().lower()
+            # Typical read-only sections
+            if any(x in name for x in ['rodata', '.const', '.rdata', '.text']):
+                self.rodata_ranges.append((block.getStart(), block.getEnd()))
+            # Also check permissions - read but not write
+            elif block.isRead() and not block.isWrite() and not block.isExecute():
+                self.rodata_ranges.append((block.getStart(), block.getEnd()))
+    
+    def _is_constant_string_ptr(self, varnode):
+        """Check if varnode points to a constant string in rodata"""
+        if not varnode:
+            return False
+        
+        # Direct address check
+        if varnode.isAddress():
+            addr = varnode.getAddress()
+            for start, end in self.rodata_ranges:
+                if addr.compareTo(start) >= 0 and addr.compareTo(end) <= 0:
+                    return True
+        
+        # Check if constant value is in rodata range
+        if varnode.isConstant():
+            return True  # Constants are always safe for format strings
+        
+        # Check symbol - PTR_s_* or PTR_DAT_* in rodata are constant strings
+        high = varnode.getHigh()
+        if high and high.getSymbol():
+            name = high.getSymbol().getName()
+            # PTR_s_* are string pointers, typically to rodata
+            if name.startswith("PTR_s_") or name.startswith("s_"):
+                return True
+            # Check if symbol is in rodata
+            sym_addr = high.getSymbol().getAddress() if hasattr(high.getSymbol(), 'getAddress') else None
+            if sym_addr:
+                for start, end in self.rodata_ranges:
+                    if sym_addr.compareTo(start) >= 0 and sym_addr.compareTo(end) <= 0:
+                        return True
+        
+        # Trace definition - LOAD from constant address
+        def_op = varnode.getDef()
+        if def_op:
+            if def_op.getOpcode() == PcodeOp.COPY:
+                return self._is_constant_string_ptr(def_op.getInput(0))
+            if def_op.getOpcode() == PcodeOp.LOAD:
+                ptr = def_op.getInput(1)
+                if ptr and ptr.isConstant():
+                    return True
+                # Check if loading from rodata
+                if ptr:
+                    return self._is_constant_string_ptr(ptr)
+            # PTRSUB/PTRADD from constant base
+            if def_op.getOpcode() in [PcodeOp.PTRSUB, PcodeOp.PTRADD]:
+                return self._is_constant_string_ptr(def_op.getInput(0))
+        
+        return False
     
     def _build_call_maps(self):
         print("[*] Building call resolution maps...")
-        
         for func in currentProgram.getFunctionManager().getFunctions(True):
             if func.isThunk():
                 thunked = func.getThunkedFunction(False)
@@ -85,14 +171,12 @@ class MemcorrDetectorV8:
             if name.startswith("PTR_"):
                 parts = name[4:].rsplit("_", 1)
                 if parts:
-                    target = parts[0]
-                    self.got_map[sym.getAddress()] = target
-                    self.got_map[name] = target
+                    self.got_map[sym.getAddress()] = parts[0]
+                    self.got_map[name] = parts[0]
         
         print("    Thunks: {}, GOT ptrs: {}".format(len(self.thunk_map), len(self.got_map)))
     
     def resolve_call_target(self, call_op):
-        """Resolve CALL or CALLIND target"""
         if call_op.getNumInputs() < 1:
             return None
         
@@ -100,7 +184,6 @@ class MemcorrDetectorV8:
         if not addr_vn:
             return None
         
-        # Direct address
         if addr_vn.isAddress():
             addr = addr_vn.getAddress()
             if addr in self.thunk_map:
@@ -108,11 +191,8 @@ class MemcorrDetectorV8:
             func = currentProgram.getListing().getFunctionAt(addr)
             if func:
                 name = func.getName()
-                if name in self.thunk_map:
-                    return self.thunk_map[name]
-                return name
+                return self.thunk_map.get(name, name)
         
-        # Constant address
         if addr_vn.isConstant():
             addr_val = addr_vn.getOffset()
             addr = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(addr_val)
@@ -122,23 +202,19 @@ class MemcorrDetectorV8:
             if func:
                 return func.getName()
         
-        # Indirect - trace through LOAD from GOT
         return self._resolve_indirect(addr_vn, 0)
     
     def _resolve_indirect(self, vn, depth):
         if depth > 5 or not vn:
             return None
         
-        # Check symbol name for PTR_ prefix
         high = vn.getHigh()
         if high and high.getSymbol():
             name = high.getSymbol().getName()
             if name in self.got_map:
                 return self.got_map[name]
             if name.startswith("PTR_"):
-                parts = name[4:].rsplit("_", 1)
-                if parts:
-                    return parts[0]
+                return name[4:].rsplit("_", 1)[0]
         
         def_op = vn.getDef()
         if not def_op:
@@ -147,31 +223,23 @@ class MemcorrDetectorV8:
         opcode = def_op.getOpcode()
         
         if opcode == PcodeOp.LOAD:
-            # Check what address we're loading from
             ptr_vn = def_op.getInput(1)
             if ptr_vn:
-                # Check symbol at load address
                 ptr_high = ptr_vn.getHigh()
                 if ptr_high and ptr_high.getSymbol():
                     sym_name = ptr_high.getSymbol().getName()
                     if sym_name in self.got_map:
                         return self.got_map[sym_name]
                     if sym_name.startswith("PTR_"):
-                        parts = sym_name[4:].rsplit("_", 1)
-                        if parts:
-                            return parts[0]
+                        return sym_name[4:].rsplit("_", 1)[0]
                 
-                # Try to get address
                 if ptr_vn.isAddress():
                     addr = ptr_vn.getAddress()
                     if addr in self.got_map:
                         return self.got_map[addr]
-                    # Check symbol at address
                     sym = currentProgram.getSymbolTable().getPrimarySymbol(addr)
                     if sym:
                         name = sym.getName()
-                        if name in self.got_map:
-                            return self.got_map[name]
                         if name.startswith("PTR_"):
                             return name[4:].rsplit("_", 1)[0]
                 
@@ -191,20 +259,17 @@ class MemcorrDetectorV8:
             sym = high.getSymbol()
             if sym:
                 name = sym.getName()
-                # Check for stack storage
                 if hasattr(sym, 'getStorage'):
                     storage = sym.getStorage()
                     if storage and storage.isStackStorage():
                         dt = high.getDataType()
                         size = dt.getLength() if dt else None
                         return True, name, size
-                # Local non-param
                 if not sym.isGlobal() and not sym.isParameter():
                     dt = high.getDataType()
                     size = dt.getLength() if dt else None
                     return True, name, size
         
-        # Check definition
         def_op = varnode.getDef()
         if def_op and def_op.getOpcode() == PcodeOp.PTRSUB:
             high = varnode.getHigh()
@@ -219,6 +284,7 @@ class MemcorrDetectorV8:
         return False, None, None
     
     def trace_taint(self, varnode, depth=0):
+        """Trace taint - returns (is_tainted, source_description)"""
         if depth > CONFIG["max_trace_depth"] or not varnode:
             return False, "?"
         
@@ -229,11 +295,23 @@ class MemcorrDetectorV8:
         if high and high.getSymbol():
             sym = high.getSymbol()
             name = sym.getName()
+            
+            # Parameters are potentially tainted (caller controlled)
             if sym.isParameter():
                 return True, "param:{}".format(name)
+            
+            # Global variables - only taint if name strongly suggests user input
+            # REMOVED 'str', 'data', 'buf' - too generic, causes false positives
             if sym.isGlobal():
-                if any(x in name.lower() for x in ['cookie', 'query', 'input', 'user', 'http', 'request', 'env', 'arg', 'data', 'buf', 'str', 'split']):
-                    return True, "global:{}".format(name)
+                # Strong indicators of user input
+                taint_indicators = [
+                    'cookie', 'query', 'input', 'user', 'http', 'request', 
+                    'env', 'argv', 'cgi', 'post', 'get_', 'form', 'param'
+                ]
+                name_lower = name.lower()
+                for indicator in taint_indicators:
+                    if indicator in name_lower:
+                        return True, "global:{}".format(name)
         
         def_op = varnode.getDef()
         if not def_op:
@@ -241,7 +319,6 @@ class MemcorrDetectorV8:
         
         opcode = def_op.getOpcode()
         
-        # Handle both CALL and CALLIND
         if opcode in [PcodeOp.CALL, PcodeOp.CALLIND]:
             func_name = self.resolve_call_target(def_op)
             if func_name:
@@ -255,15 +332,11 @@ class MemcorrDetectorV8:
         
         if opcode == PcodeOp.LOAD:
             ptr_taint, ptr_src = self.trace_taint(def_op.getInput(1), depth + 1)
-            if ptr_taint:
-                return True, "*({})".format(ptr_src)
-            return False, "load"
+            return (True, "*({})".format(ptr_src)) if ptr_taint else (False, "load")
         
         if opcode == PcodeOp.PTRADD:
             base_taint, base_src = self.trace_taint(def_op.getInput(0), depth + 1)
-            if base_taint:
-                return True, "{}[i]".format(base_src)
-            return False, "array"
+            return (True, "{}[i]".format(base_src)) if base_taint else (False, "array")
         
         if opcode == PcodeOp.PTRSUB:
             return self.trace_taint(def_op.getInput(0), depth + 1)
@@ -286,11 +359,12 @@ class MemcorrDetectorV8:
     
     def run(self):
         print("=" * 70)
-        print(" Memory Corruption Detector v8.0 - CALLIND Support")
+        print(" Memory Corruption Detector v9.0 - Reduced False Positives")
         print("=" * 70)
         
         funcs = list(currentProgram.getFunctionManager().getFunctions(True))
         print("[*] Analyzing {} functions...".format(len(funcs)))
+        print("[*] Identified {} rodata ranges for constant detection".format(len(self.rodata_ranges)))
         
         call_count = 0
         resolved_count = 0
@@ -311,14 +385,12 @@ class MemcorrDetectorV8:
                 continue
             
             freed_ptrs = {}
-            
-            # Iterate using hasNext/next pattern
             ops_iter = hf.getPcodeOps()
+            
             while ops_iter.hasNext():
                 op = ops_iter.next()
                 opcode = op.getOpcode()
                 
-                # Check both CALL and CALLIND
                 if opcode not in [PcodeOp.CALL, PcodeOp.CALLIND]:
                     continue
                 
@@ -389,12 +461,17 @@ class MemcorrDetectorV8:
             return
         
         fmt_vn = op.getInput(fmt_idx + 1)
+        
+        # Skip constant/rodata format strings - they're safe
         if fmt_vn.isConstant():
             return
+        if self._is_constant_string_ptr(fmt_vn):
+            return
         
+        # Now check if format is actually tainted (user-controlled)
         fmt_tainted, fmt_src = self.trace_taint(fmt_vn)
         if fmt_tainted:
-            details = "{}(fmt={}) - user-controlled format".format(call_name, fmt_src)
+            details = "{}(fmt={}) - user-controlled format string".format(call_name, fmt_src)
             self._add_finding(func.getName(), addr, "FORMAT_STRING", "HIGH", details)
     
     def _check_free(self, op, func, freed_ptrs, ptr_idx, addr):
@@ -424,13 +501,41 @@ class MemcorrDetectorV8:
             "details": details
         })
         
+        paddr = addr
+        if hasattr(paddr, 'getPhysicalAddress'):
+            paddr = paddr.getPhysicalAddress()
+        
+        # Add bookmark
         try:
-            paddr = addr
-            if hasattr(paddr, 'getPhysicalAddress'):
-                paddr = paddr.getPhysicalAddress()
-            currentProgram.getBookmarkManager().setBookmark(
-                paddr, "Analysis", "{}:{}".format(severity, vuln_type),
-                details[:80])
+            bm = currentProgram.getBookmarkManager()
+            bm.setBookmark(paddr, "Analysis", 
+                          "[{}] {}".format(severity, vuln_type),
+                          details[:80])
+        except:
+            pass
+        
+        # Add plate comment
+        try:
+            listing = currentProgram.getListing()
+            cu = listing.getCodeUnitAt(paddr)
+            if cu:
+                comment = ">>> VULN: {} [{}] <<<\n{}".format(vuln_type, severity, details)
+                existing = cu.getComment(CodeUnit.PLATE_COMMENT)
+                if existing:
+                    if vuln_type not in existing:
+                        comment = existing + "\n" + comment
+                    else:
+                        comment = existing
+                cu.setComment(CodeUnit.PLATE_COMMENT, comment)
+        except:
+            pass
+        
+        # Add EOL comment
+        try:
+            listing = currentProgram.getListing()
+            cu = listing.getCodeUnitAt(paddr)
+            if cu:
+                cu.setComment(CodeUnit.EOL_COMMENT, "[!] {} - {}".format(severity, vuln_type))
         except:
             pass
     
@@ -448,13 +553,20 @@ class MemcorrDetectorV8:
                 if count:
                     print("    {}: {}".format(sev, count))
             
+            print("\n[*] By Type:")
+            types = {}
+            for f in self.findings:
+                types[f["type"]] = types.get(f["type"], 0) + 1
+            for t, c in sorted(types.items(), key=lambda x: -x[1]):
+                print("    {}: {}".format(t, c))
+            
             print("\n[!] Findings:")
             for f in sorted(self.findings, key=lambda x: (x["severity"] != "HIGH", x["func"])):
                 print("    [{}/{}] {} @ {}".format(f["severity"], f["type"], f["func"], f["addr"]))
-                print("        {}".format(f["details"][:80]))
+                print("        {}".format(f["details"][:100]))
         
         try:
-            out_path = os.path.join(os.path.expanduser("~"), "memcorr_v8.json")
+            out_path = os.path.join(os.path.expanduser("~"), "memcorr_v9.json")
             with open(out_path, "w") as fp:
                 json.dump({"findings": self.findings}, fp, indent=2)
             print("\n[*] Results: {}".format(out_path))
@@ -463,7 +575,7 @@ class MemcorrDetectorV8:
 
 
 def run():
-    detector = MemcorrDetectorV8()
+    detector = MemcorrDetectorV9()
     detector.run()
 
 run()
