@@ -87,7 +87,7 @@ JOERN_SCRIPTS_DIR = Path(os.environ.get(
 # Override with:
 #   setx JOERN_AUTO_IMPORT "uaf_heuristic.sc"
 JOERN_AUTO_IMPORT = [
-    s.strip() for s in os.environ.get("JOERN_AUTO_IMPORT", "uaf_heuristic.sc,primitives.sc").split(",")
+    s.strip() for s in os.environ.get("JOERN_AUTO_IMPORT", "uaf_heuristic.sc,primitives.sc,memcorr_primitives.sc,info_leak.sc").split(",")
     if s.strip()
 ]
 
